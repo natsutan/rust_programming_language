@@ -1,9 +1,8 @@
-
-fn process() {
-    fn add(a, b) {
-        a + b;
-    }
-    add(1, pow(2, 3));
+fn early(a, b) {
+    if a < b {
+        return a;
+    };
+    b;
 }
 
-print(process());
+print(early(1, 2));
