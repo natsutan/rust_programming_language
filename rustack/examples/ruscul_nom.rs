@@ -1,4 +1,6 @@
 // https://github.com/msakuta/ruscal/tree/master/examples
+// run --package rustack_nom --example ruscul_nom
+
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
