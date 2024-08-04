@@ -5,6 +5,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::Read;
+use std::mem::ManuallyDrop;
 use std::ops::ControlFlow;
 
 use nom::{branch::alt, bytes::complete::tag, character::complete::{
@@ -79,6 +80,100 @@ impl PartialOrd for Value {
     }
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum TypeDecl {
+    Any,
+    F64,
+    I64,
+    Str
+}
+
+fn tc_coerce_type<'src> (value: &TypeDecl, target: &TypeDecl) -> Result<TypeDecl, TypeCheckError> {
+    use TypeDecl::*;
+    Ok(match (value, target) {
+        (_, any) => value.clone(),
+        (Any, _) => target.clone(),
+        (F64 | I64, F64) => F64,
+        (F64, I64) => F64,
+        (I64, I64) => I64,
+        (Str,Str) => Str,
+        _ => {{
+        return Err(TypeCheckError::new(format!(
+            "{:?} cannot be assigned to {:?}", value, target
+        )))
+        }}
+    })
+
+
+}
+
+pub struct TypeCheckerContext<'src> {
+    vars: HashMap<&'src str, TypeDecl>,
+    funcs: HashMap<String, FnDef<'src>>,
+    super_context: Option<&'src TypeCheckerContext<'src>>
+}
+
+impl<'src> TypeCheckerContext<'src> {
+    pub fn new() -> Self {
+        Self {
+            vars: HashMap::new(),
+            funcs: HashMap::new(),
+            super_context: None,
+        }
+    }
+
+    fn get_var(&self, name: &str) -> Option<TypeDecl> {
+        if let Some(val) = self.vars.get(name) {
+            Some(val.clone())
+        } else {
+            None
+        }
+    }
+    fn get_fn(&self, name: &str) -> Option<&FnDef<'src>> {
+        if let Some(val) = self.funcs.get(name) {
+            Some(val)
+        } else if let Some(super_ctx) = self.super_context {
+            super_ctx.get_fn(name)
+        } else {
+            None
+        }
+    }
+}
+
+
+#[derive(Debug)]
+pub struct TypeCheckError {
+    msg: String,
+}
+
+impl<'src> std::fmt::Display for TypeCheckError {
+    fn fmt (&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.msg)
+    }
+
+
+}
+
+impl TypeCheckError {
+    fn new(msg: String) -> Self {
+        Self {msg}
+    }
+}
+
+fn tc_expr<'src, 'b> (e: &'b Expression<'src>, ctx: &mut TypeCheckerContext<'src> ) -> Result<TypeDecl, TypeCheckError> {
+    use Expression::*;
+    Ok(match &e {
+        NumLiteral(_val) => TypeDecl::F64,
+        StrLiteral(_val) => TypeDecl::Str,
+        Ident(str) => ctx.get_var(str).ok_or_else( || {
+            TypeCheckError::new(format!("Variable {} not found in scope", str))
+        })?,
+        _ => todo!(),
+    })
+}
+
+
+
 fn coerce_f64(a: &Value) -> f64 {
     match a {
         Value::F64(v) => *v as f64,
@@ -115,7 +210,7 @@ impl<'src> FnDef<'src> {
                 new_frame.vars = args
                 .iter()
                 .zip(code.args.iter())
-                .map(|(arg, name)| (name.to_string(), arg.clone()))
+                .map(|(arg, decl)| (decl.0.to_string(), arg.clone()))
                 .collect();
                 match eval_stmts(&code.stmts, &mut new_frame) {
                     EvalResult::Continue(val) | EvalResult::Break(BreakResult::Return(val)) => val,
@@ -133,7 +228,8 @@ impl<'src> FnDef<'src> {
 }
 
 struct UserFn<'src> {
-    args: Vec<&'src str>,
+    args: Vec<(&'src str, TypeDecl)>,
+    ret_type: TypeDecl,
     stmts: Statements<'src>,
 }
 
@@ -240,7 +336,7 @@ fn eval_stmts<'src>(
                 last_result = EvalResult::Continue(eval(expr, frame)?);
 
             }
-            Statement::VarDef(name,expr) => {
+            Statement::VarDef(name, _td, expr) => {
                 let value = eval(expr, frame)?;
                 frame.vars.insert(name.to_string(), value);
             }
@@ -275,11 +371,12 @@ fn eval_stmts<'src>(
 
                 }
             }
-            Statement::FnDef {name ,args, stmts} => {
+            Statement::FnDef {name ,args, ret_type, stmts} => {
                 frame.funcs.insert(
                     name.to_string(),
                     FnDef::User(UserFn {
                         args: args.clone(),
+                        ret_type: *ret_type,
                         stmts: stmts.clone(),
                     }),
 
@@ -322,7 +419,7 @@ enum Expression<'src> {
 #[derive(Debug, PartialEq, Clone)]
 enum Statement<'src> {
     Expression(Expression<'src>),
-    VarDef(&'src str, Expression<'src>),
+    VarDef(&'src str, TypeDecl,  Expression<'src>),
     VarAssign(&'src str, Expression<'src>),
     For {
       loop_var: &'src str,
@@ -332,7 +429,8 @@ enum Statement<'src> {
     },
     FnDef {
         name: &'src str,
-        args: Vec<&'src str>,
+        args: Vec<(&'src str, TypeDecl)>,
+        ret_type : TypeDecl,
         stmts: Statements<'src>,
     },
     Return(Expression<'src>),
@@ -663,11 +761,40 @@ fn var_def(i: &str) -> IResult<&str, Statement> {
     let (i, _) = 
     delimited(multispace0, tag("var"), multispace1)(i)?;
     let (i, name) = space_delimited(identifier)(i)?;
+
+    let (i, _) = space_delimited(char(':'))(i)?;
+    let (i, td) = type_decl(i)?;
+
     let (i, _) = space_delimited(char('='))(i)?;
     let (i, expr) = space_delimited(expr)(i)?;
     let (i, _) = space_delimited(char(';'))(i)?;
-    Ok((i, Statement::VarDef(name, expr)))
+    Ok((i, Statement::VarDef(name, td, expr)))
 }
+
+fn type_decl(i: &str) -> IResult<&str, TypeDecl> {
+    let (i, td) = space_delimited(identifier)(i)?;
+    Ok((
+        i,
+        match td {
+            "i64" => TypeDecl::I64,
+            "f64" => TypeDecl::F64,
+            "str" => TypeDecl::Str,
+            _ => {
+                panic!("Type annotation has unknown type: {td}")
+            }
+        },
+    ))
+}
+
+fn argument(i: &str) -> IResult<&str, (&str, TypeDecl)> {
+    let (i, ident) = space_delimited(identifier)(i)?;
+    let (i, _) = char(':')(i)?;
+    let (i, td) = type_decl(i)?;
+    Ok((i, (ident, td)))
+
+}
+
+
 
 fn var_assign(i: &str) -> IResult<&str, Statement> {
     let(i, name) = space_delimited(identifier)(i)?;
@@ -707,11 +834,14 @@ fn fn_def_statement(i: &str) -> IResult<&str, Statement> {
     let (i, name) = space_delimited(identifier)(i)?;
     let (i, _) = space_delimited(tag("("))(i)?;
     let (i, args) = 
-        separated_list0(char(','), space_delimited(identifier))(i)?;
+        separated_list0(char(','), space_delimited(argument))(i)?;
     let (i, _) = space_delimited(tag(")"))(i)?;
+    let (i, _) = space_delimited(tag("->"))(i)?;
+    let (i, ret_type) = type_decl(i)?;
+
     let (i, stmts) = 
         delimited(open_brace, statements, close_brace)(i)?;
-    Ok((i, Statement::FnDef {name, args, stmts}))
+    Ok((i, Statement::FnDef {name, args, ret_type,  stmts}))
 
 }
 
