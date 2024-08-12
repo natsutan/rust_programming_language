@@ -10,28 +10,27 @@ use std::ops::ControlFlow;
 
 use nom::{branch::alt, bytes::complete::tag, character::complete::{
     alpha1, alphanumeric1, char, multispace0
-}, combinator::{opt, recognize}, multi::{fold_many0, many0}, sequence::{delimited, pair, preceded, terminated}, IResult, Parser, error::ParseError, Finish, error};
+}, combinator::{cut, map_res, opt, recognize}, multi::{fold_many0, many0}, sequence::{delimited, pair, preceded, terminated}, IResult, Parser, error::ParseError, Finish, InputTake, error, Offset};
 use nom::character::complete::{multispace1, none_of};
 use nom::multi::separated_list0;
 use nom::number::complete::recognize_float;
 use rustack::{parse_args, RunMode};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(args) = parse_args(false) else {
-        return Ok(())
-    };
+use nom_locate::LocatedSpan;
 
-    let src_file = args.source.as_ref().ok_or_else(
-        || {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(args) = parse_args(false) else { return Ok(())};
+
+    let src_file = args.source.as_ref().ok_or_else( || {
             "Please specify source file to compile after -c"
-        }
-    )?;
+        })?;
 
     let source = std::fs::read_to_string(src_file)?;
 
 
-    let parsed_statements = match statements_finish(&source) {
-        Ok(parsed_statements) => parsed_statements,
+    let parsed_statements = 
+    	match statements_finish(Span::new(&source)) {
+        Ok(stmts) => stmts,
         Err(e) => {
             eprintln!("Parse error: {e:?}");
             return Ok(());
@@ -42,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("AST: {parsed_statements:#?}");
     }
 
-    let mut tc_ctx = TypeCheckerContext::new();
+    let mut tc_ctx = TypeCheckContext::new();
 
     if let Err(err) = type_check(&parsed_statements, &mut tc_ctx) {
         println!("Type check errr: {err}");
@@ -57,6 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+type Span<'a> = LocatedSpan<&'a str>;
 
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
@@ -104,10 +104,10 @@ pub enum TypeDecl {
     Any,
     F64,
     I64,
-    Str
+    Str,
 }
 
-fn tc_coerce_type<'src> (value: &TypeDecl, target: &TypeDecl) -> Result<TypeDecl, TypeCheckError> {
+fn tc_coerce_type<'src> (value: &TypeDecl, target: &TypeDecl, span: Span<'src>) -> Result<TypeDecl, TypeCheckError<'src>> {
     use TypeDecl::*;
     Ok(match (value, target) {
         (_, Any) => value.clone(),
@@ -119,22 +119,22 @@ fn tc_coerce_type<'src> (value: &TypeDecl, target: &TypeDecl) -> Result<TypeDecl
         _ => {{
         return Err(TypeCheckError::new(format!(
             "{:?} cannot be assigned to {:?}", value, target
-        )))
+        ), span))
         }}
     })
 }
 
-pub struct TypeCheckerContext<'src> {
+pub struct TypeCheckContext<'src, 'ctx> {
     vars: HashMap<&'src str, TypeDecl>,
     funcs: HashMap<String, FnDef<'src>>,
-    super_context: Option<&'src TypeCheckerContext<'src>>
+    super_context: Option<&'ctx TypeCheckContext<'src, 'ctx>>,
 }
 
-impl<'src> TypeCheckerContext<'src> {
+impl<'src, 'ctx> TypeCheckContext<'src, 'ctx> {
     pub fn new() -> Self {
         Self {
             vars: HashMap::new(),
-            funcs: HashMap::new(),
+            funcs: standard_functions(),
             super_context: None,
         }
     }
@@ -156,7 +156,7 @@ impl<'src> TypeCheckerContext<'src> {
         }
     }
 
-    fn push_stack(super_ctx: &'src Self) -> Self {
+    fn push_stack(super_ctx: &'ctx Self) -> Self {
         Self {
             vars: HashMap::new(),
             funcs: HashMap::new(),
@@ -167,42 +167,45 @@ impl<'src> TypeCheckerContext<'src> {
 
 
 #[derive(Debug)]
-pub struct TypeCheckError {
+pub struct TypeCheckError<'src> {
     msg: String,
+    span: Span<'src>
 }
 
-impl<'src> std::fmt::Display for TypeCheckError {
+
+
+impl<'src> std::fmt::Display for TypeCheckError<'src> {
     fn fmt (&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.msg)
+        write!(f, "{}\nlocation {}:{}",
+               self.msg, self.span.location_line(), self.span.get_utf8_column())
     }
 
 
 }
 
-impl TypeCheckError {
-    fn new(msg: String) -> Self {
-        Self {msg}
+impl<'src> TypeCheckError<'src> {
+    fn new(msg: String, span: Span<'src>) -> Self {
+        Self {msg, span}
     }
 }
 
-fn tc_expr<'src> (e: &Expression<'src>, ctx: &mut TypeCheckerContext<'src> ) -> Result<TypeDecl, TypeCheckError> {
-    use Expression::*;
-    Ok(match &e {
+fn tc_expr<'src> (e: &Expression<'src>, ctx: &mut TypeCheckContext<'src, '_> ) -> Result<TypeDecl, TypeCheckError<'src>> {
+    use ExprEnum::*;
+    Ok(match &e.expr {
         NumLiteral(_val) => TypeDecl::F64,
         StrLiteral(_val) => TypeDecl::Str,
         Ident(str) => ctx.get_var(str).ok_or_else( || {
-            TypeCheckError::new(format!("Variable {} not found in scope", str))
+            TypeCheckError::new(format!("Variable {} not found in scope", str), e.span)
         })?,
         FnInvoke(str, args) => {
-            let args_ty = args.iter().map(|v| tc_expr(v, ctx)).collect::<Result<Vec<_>, _>>()?;
-            let func = ctx.get_fn(*str).ok_or_else(|| {
+            let args_ty = args.iter().map(|v| Ok((tc_expr(v, ctx)?, v.span))).collect::<Result<Vec<_>, _>>()?;
+            let func = ctx.get_fn(**str).ok_or_else(|| {
                 TypeCheckError::new(format!(
-                    "function {} is no defined", str
-                ))
+                    "function {} is no defined", str), *str)
             })?;
             let args_decl = func.args();
-            for (arg_ty, decl) in args_ty.iter().zip(args_decl.iter()) {
-                tc_coerce_type(&arg_ty, &decl.1)?;
+            for ((arg_ty, arg_span), decl) in args_ty.iter().zip(args_decl.iter()) {
+                tc_coerce_type(&arg_ty, &decl.1, *arg_span)?;
             }
             func.ret_type()
         },
@@ -213,16 +216,21 @@ fn tc_expr<'src> (e: &Expression<'src>, ctx: &mut TypeCheckerContext<'src> ) -> 
         Lt(lhs, rhs) => tc_binary_cmp(&lhs, &rhs, ctx, "LT")?,
         Gt(lhs, rhs) => tc_binary_cmp(&lhs, &rhs, ctx, "GT")?,
         If(cond, true_branch, false_branch) => {
-            tc_coerce_type(&tc_expr(cond, ctx)?, &TypeDecl::I64)?;
+            tc_coerce_type(&tc_expr(cond, ctx)?, &TypeDecl::I64, cond.span)?;
             let true_type = type_check(true_branch, ctx)?;
-            if let Some(false_type) = false_branch {
-                let false_type = type_check(false_type, ctx)?;
+            if let Some(false_branch) = false_branch {
+                let false_type = type_check(false_branch, ctx)?;
                 binary_op_type(&true_type, &false_type).map_err(
                     |_| {
+                        let true_span = true_branch.span();
+                        let false_span = false_branch.span();
+
                         TypeCheckError::new(format!(
                             "Conditional expression doesn't have the compable types in true and false brach: {:?} and {:?}",
                             true_type, false_type
-                        ))
+                        ),
+                        calc_offset(true_span, false_span),
+                        )
                     },
                 )?
             } else {
@@ -232,35 +240,42 @@ fn tc_expr<'src> (e: &Expression<'src>, ctx: &mut TypeCheckerContext<'src> ) -> 
     })
 }
 
-fn type_check<'src> (stmts: &Vec<Statement<'src>>, ctx: &mut TypeCheckerContext<'src>) -> Result<TypeDecl, TypeCheckError> {
+fn calc_offset<'a>(i: Span<'a>, r: Span<'a>) -> Span<'a> {
+    i.take(i.offset(&r))
+}
+
+fn type_check<'src> (
+    stmts: &Vec<Statement<'src>>,
+    ctx: &mut TypeCheckContext<'src, '_>,
+    ) -> Result<TypeDecl, TypeCheckError<'src>> {
     let mut res = TypeDecl::Any;
     for stmt in stmts {
         match stmt {
-            Statement::VarDef(var, type_, init_expr) => {
-                let init_type = tc_expr(init_expr, ctx)?;
-                let init_type = tc_coerce_type(&init_type, type_)?;
-                ctx.vars.insert(*var, init_type);
+            Statement::VarDef{name, td, ex, ..} => {
+                let init_type = tc_expr(ex, ctx)?;
+                let init_type = tc_coerce_type(&init_type, td, ex.span)?;
+                ctx.vars.insert(**name, init_type);
             }
-            Statement::VarAssign(var, expr) => {
-                let init_type = tc_expr(expr, ctx)?;
-                let var = ctx.vars.get(*var).expect("Variable not found");
-                tc_coerce_type(&init_type, var)?;
+            Statement::VarAssign{name, ex, ..} => {
+                let init_type = tc_expr(ex, ctx)?;
+                let target = ctx.vars.get(**name).expect("Variable not found");
+                tc_coerce_type(&init_type, target, ex.span)?;
             }
             Statement::FnDef { name, args, ret_type, stmts} => {
                 ctx.funcs.insert(name.to_string(), FnDef::User(UserFn {args: args.clone(), ret_type: *ret_type, stmts: stmts.clone()}));
-                let mut subctx = TypeCheckerContext::push_stack(ctx);
+                let mut subctx = TypeCheckContext::push_stack(ctx);
                 for (arg, ty) in args.iter() {
                     subctx.vars.insert(arg, *ty);
                 }
                 let last_stmt = type_check(stmts, &mut subctx)?;
-                tc_coerce_type(&last_stmt, &ret_type)?;
+                tc_coerce_type(&last_stmt, &ret_type, stmts.span())?;
             }
             Statement::Expression(e) => {
                 res = tc_expr(&e, ctx)?
             }
-            Statement::For {loop_var, start, end, stmts} => {
-                tc_coerce_type(&tc_expr(start, ctx)?, &TypeDecl::I64)?;
-                tc_coerce_type(&tc_expr(end, ctx)?, &TypeDecl::I64)?;
+            Statement::For {loop_var, start, end, stmts, ..} => {
+                tc_coerce_type(&tc_expr(start, ctx)?, &TypeDecl::I64, start.span)?;
+                tc_coerce_type(&tc_expr(end, ctx)?, &TypeDecl::I64, end.span)?;
                 ctx.vars.insert(loop_var, TypeDecl::I64);
                 res = type_check(stmts, ctx)?;
             }
@@ -330,7 +345,9 @@ impl<'src> FnDef<'src> {
 
     fn args(&self) -> Vec<(&'src str, TypeDecl)> {
         match self {
-            Self::User(user) => user.args.clone(),
+            Self::User(user) => {
+                user.args.iter().map(|arg| (&**arg.0, arg.1)).collect()
+            },
             Self::Native(code) => code.args.clone()
         }
     }
@@ -344,7 +361,7 @@ impl<'src> FnDef<'src> {
 }
 
 struct UserFn<'src> {
-    args: Vec<(&'src str, TypeDecl)>,
+    args: Vec<(Span<'src>, TypeDecl)>,
     ret_type: TypeDecl,
     stmts: Statements<'src>,
 }
@@ -365,63 +382,9 @@ struct StackFrame<'src> {
 
 impl <'src> StackFrame<'src> {
     fn new() -> Self {
-        let mut funcs = Functions::new();
-        funcs.insert("sqrt".to_string(), unary_fn(f64::sqrt));
-        funcs.insert("sin".to_string(), unary_fn(f64::sin));
-        funcs.insert("cos".to_string(), unary_fn(f64::cos));
-        funcs.insert("tan".to_string(), unary_fn(f64::tan));
-        funcs.insert("asin".to_string(), unary_fn(f64::asin));
-        funcs.insert("acos".to_string(), unary_fn(f64::acos));
-        funcs.insert("atan".to_string(), unary_fn(f64::atan));
-        funcs.insert("atan2".to_string(), binary_fn(f64::atan2));
-        funcs.insert("pow".to_string(), binary_fn(f64::powf));
-        funcs.insert("exp".to_string(), unary_fn(f64::exp));
-        funcs.insert("log".to_string(), binary_fn(f64::log));
-        funcs.insert("log10".to_string(), unary_fn(f64::log10));
-        funcs.insert(
-            "print".to_string(), FnDef::Native(NativeFn{
-                args:vec![("arg", TypeDecl::Any)],
-                ret_type: TypeDecl::Any,
-                code: Box::new(print)})
-        );
-        funcs.insert(
-            "dgb".to_string(), FnDef::Native(NativeFn{
-                args:vec![("arg", TypeDecl::Any)],
-                ret_type: TypeDecl::Any,
-                code: Box::new(p_dbg)
-            })
-        );
-        funcs.insert(
-            "i64".to_string(), FnDef::Native(NativeFn{
-                args:vec![("arg", TypeDecl::Any)],
-                ret_type: TypeDecl::I64,
-                code: Box::new(move |args| {Value::I64(coerce_i64(args.first().expect("function missing argument"),
-                ))})
-            })
-        );
-        funcs.insert(
-            "f64".to_string(), FnDef::Native(NativeFn{
-                args:vec![("arg", TypeDecl::Any)],
-                ret_type: TypeDecl::F64,
-                code: Box::new(move |args| {Value::F64(coerce_f64(args.first().expect("function missing argument"),
-                ))})
-            })
-        );
-        funcs.insert(
-            "str".to_string(),
-            FnDef::Native(NativeFn {
-                args:vec![("arg", TypeDecl::Any)],
-                ret_type: TypeDecl::Str,
-                code: Box::new(move |args| {
-                    Value::Str(coerce_str(
-                        args.first().expect("function missing argument"),
-                    ))
-                }),
-            }),
-        );
         Self {
             vars: Variables::new(),
-            funcs,
+            funcs: standard_functions(),
             uplevel: None,
         }
     }
@@ -444,6 +407,67 @@ impl <'src> StackFrame<'src> {
         }
         None
     }
+
+
+
+}
+
+fn standard_functions<'src>() -> Functions<'src> {
+    let mut funcs = Functions::new();
+    funcs.insert("sqrt".to_string(), unary_fn(f64::sqrt));
+    funcs.insert("sin".to_string(), unary_fn(f64::sin));
+    funcs.insert("cos".to_string(), unary_fn(f64::cos));
+    funcs.insert("tan".to_string(), unary_fn(f64::tan));
+    funcs.insert("asin".to_string(), unary_fn(f64::asin));
+    funcs.insert("acos".to_string(), unary_fn(f64::acos));
+    funcs.insert("atan".to_string(), unary_fn(f64::atan));
+    funcs.insert("atan2".to_string(), binary_fn(f64::atan2));
+    funcs.insert("pow".to_string(), binary_fn(f64::powf));
+    funcs.insert("exp".to_string(), unary_fn(f64::exp));
+    funcs.insert("log".to_string(), binary_fn(f64::log));
+    funcs.insert("log10".to_string(), unary_fn(f64::log10));
+    funcs.insert(
+        "print".to_string(), FnDef::Native(NativeFn{
+            args:vec![("arg", TypeDecl::Any)],
+            ret_type: TypeDecl::Any,
+            code: Box::new(print)})
+    );
+    funcs.insert(
+        "dgb".to_string(), FnDef::Native(NativeFn{
+            args:vec![("arg", TypeDecl::Any)],
+            ret_type: TypeDecl::Any,
+            code: Box::new(p_dbg)
+        })
+    );
+    funcs.insert(
+        "i64".to_string(), FnDef::Native(NativeFn{
+            args:vec![("arg", TypeDecl::Any)],
+            ret_type: TypeDecl::I64,
+            code: Box::new(move |args| {Value::I64(coerce_i64(args.first().expect("function missing argument"),
+            ))})
+        })
+    );
+    funcs.insert(
+        "f64".to_string(), FnDef::Native(NativeFn{
+            args:vec![("arg", TypeDecl::Any)],
+            ret_type: TypeDecl::F64,
+            code: Box::new(move |args| {Value::F64(coerce_f64(args.first().expect("function missing argument"),
+            ))})
+        })
+    );
+    funcs.insert(
+        "str".to_string(),
+        FnDef::Native(NativeFn {
+            args:vec![("arg", TypeDecl::Any)],
+            ret_type: TypeDecl::Str,
+            code: Box::new(move |args| {
+                Value::Str(coerce_str(
+                    args.first().expect("function missing argument"),
+                ))
+            }),
+        }),
+    );
+    funcs
 }
 
 fn print(values : &[Value]) -> Value {
@@ -467,15 +491,15 @@ fn eval_stmts<'src>(
                 last_result = EvalResult::Continue(eval(expr, frame)?);
 
             }
-            Statement::VarDef(name, _td, expr) => {
-                let value = eval(expr, frame)?;
+            Statement::VarDef{name, ex, ..} => {
+                let value = eval(ex, frame)?;
                 frame.vars.insert(name.to_string(), value);
             }
-            Statement::VarAssign(name, expr) => {
-                if !frame.vars.contains_key(*name) {
+            Statement::VarAssign{name, ex, ..} => {
+                if !frame.vars.contains_key(**name) {
                     panic!("Variable is not defined");
                 }
-                let value = eval(expr, frame)?;
+                let value = eval(ex, frame)?;
                 frame.vars.insert(name.to_string(), value);
             }
             Statement::For {
@@ -483,6 +507,7 @@ fn eval_stmts<'src>(
             	start, 
             	end, 
             	stmts,
+                ..
             	} => {
                 let start = eval(start, frame)?.as_i64().expect("start needs to be an integer");
                 let end = eval(end, frame)?.as_i64().expect("end needs to be an integer");
@@ -528,11 +553,24 @@ fn eval_stmts<'src>(
 }
 
 #[derive(Debug, PartialEq, Clone)]
-enum Expression<'src> {
-    Ident(&'src str),
+struct Expression<'a> {
+    pub(crate) expr: ExprEnum<'a>,
+    pub(crate) span: Span<'a>
+
+}
+
+impl<'a> Expression<'a> {
+    fn new(expr: ExprEnum<'a>, span: Span<'a>) -> Self {
+        Self {expr, span}
+    }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+enum ExprEnum<'src> {
+    Ident(Span<'src>),
     NumLiteral(f64),
     StrLiteral(String),
-    FnInvoke(&'src  str, Vec<Expression<'src>>),
+    FnInvoke(Span<'src>, Vec<Expression<'src>>),
     Add(Box<Expression<'src>>, Box<Expression<'src>>),
     Sub(Box<Expression<'src>>, Box<Expression<'src>>),
     Mul(Box<Expression<'src>>, Box<Expression<'src>>),
@@ -550,17 +588,27 @@ enum Expression<'src> {
 #[derive(Debug, PartialEq, Clone)]
 enum Statement<'src> {
     Expression(Expression<'src>),
-    VarDef(&'src str, TypeDecl,  Expression<'src>),
-    VarAssign(&'src str, Expression<'src>),
+    VarDef {
+        span : Span<'src>,
+        name: Span<'src>,
+        td: TypeDecl,
+        ex : Expression<'src>
+    },
+    VarAssign {
+        span: Span<'src>,
+        name: Span<'src>,
+        ex: Expression<'src>
+    },
     For {
-      loop_var: &'src str,
+        span: Span<'src>,
+      loop_var: Span<'src>,
         start: Expression<'src>,
         end: Expression<'src>,
         stmts: Statements<'src>,
     },
     FnDef {
-        name: &'src str,
-        args: Vec<(&'src str, TypeDecl)>,
+        name: Span<'src>,
+        args: Vec<(Span<'src>, TypeDecl)>,
         ret_type : TypeDecl,
         stmts: Statements<'src>,
     },
@@ -569,8 +617,36 @@ enum Statement<'src> {
     Continue,
 }
 
+impl<'src> Statement<'src> {
+    fn span(&self) -> Option<Span<'src>> {
+        use Statement::*;
+        Some(match self {
+            Expression(ex) => ex.span,
+            VarDef{ span, ..} => *span,
+            VarAssign { span, ..} => *span,
+            For { span, ..} => *span,
+            FnDef { name, stmts, ..} => {
+                calc_offset(*name, stmts.span())
+            },
+            Return(ex) => ex.span,
+            Break | Continue => return None,
+        })
+
+    }
+}
 
 type Statements<'a> = Vec<Statement<'a>>;
+
+trait GetSpan<'a> {
+    fn span(&self) -> Span<'a>;
+}
+
+impl<'a> GetSpan<'a> for Statements<'a> {
+    fn span(&self) -> Span<'a> {
+        self.iter().find_map(|stmt| stmt.span()).unwrap()
+    }
+}
+
 
 #[derive(Debug)]
 enum BreakResult {
@@ -615,10 +691,11 @@ fn binary_fn<'a>(f: fn(f64, f64) -> f64) -> FnDef<'a> {
 }
 
 
-fn tc_binary_op<'src> (lhs: &Expression<'src>, rhs: &Expression<'src>, ctx: &mut TypeCheckerContext<'src>, op: &str) -> Result<TypeDecl, TypeCheckError> {
+fn tc_binary_op<'src> (lhs: &Expression<'src>, rhs: &Expression<'src>, ctx: &mut TypeCheckContext<'src, '_>, op: &str) -> Result<TypeDecl, TypeCheckError<'src>> {
     let lhst = tc_expr(lhs, ctx)?;
     let rhst = tc_expr(rhs, ctx)?;
-    binary_op_type(&lhst, &rhst).map_err(|_| {TypeCheckError::new(format!("Operation {op} between incompatibel type {:?} and {:?}", lhst, rhst))})
+    binary_op_type(&lhst, &rhst).map_err(|_| {
+        TypeCheckError::new(format!("Operation {op} between incompatibel type {:?} and {:?}", lhst, rhst), lhs.span)})
 }
 
 fn binary_op_type(lhs: &TypeDecl, rhs: &TypeDecl) -> Result<TypeDecl, ()> {
@@ -633,7 +710,7 @@ fn binary_op_type(lhs: &TypeDecl, rhs: &TypeDecl) -> Result<TypeDecl, ()> {
     })
 }
 
-fn tc_binary_cmp<'src> (lhs: &Expression<'src>, rhs: &Expression<'src>, ctx: &mut TypeCheckerContext<'src>, op: &str) -> Result<TypeDecl, TypeCheckError> {
+fn tc_binary_cmp<'src> (lhs: &Expression<'src>, rhs: &Expression<'src>, ctx: &mut TypeCheckContext<'src, '_>, op: &str) -> Result<TypeDecl, TypeCheckError<'src>> {
     use TypeDecl::*;
     let lhst = tc_expr(lhs, ctx)?;
     let rhst = tc_expr(rhs, ctx)?;
@@ -646,7 +723,7 @@ fn tc_binary_cmp<'src> (lhs: &Expression<'src>, rhs: &Expression<'src>, ctx: &mu
         _ => {
             return Err(TypeCheckError::new(format!(
                 "Operation {op} between incompatible type: {:?} and {:?}", lhst, rhst
-            )))
+            ), lhs.span))
 
         }
     })
@@ -729,12 +806,15 @@ fn eval<'src>(
 	expr: &Expression<'src>, 
 	frame: &mut StackFrame<'src>,
 	) -> EvalResult {
-    use Expression::*;
-    let res = match expr {
-        Ident("pi") =>  Value::F64(std::f64::consts::PI),
+    use ExprEnum::*;
+    let res = match &expr.expr {
         Ident(id) => {
-            println!("{:?}", *id);
-            frame.vars.get(*id).cloned().expect("Variable not found")
+            if **id == "pi" {
+                Value::F64(std::f64::consts::PI)
+            } else {
+                frame.vars.get(**id).cloned().expect("Variable not found")
+
+            }
         },
         NumLiteral(n) => Value::F64(*n),
         StrLiteral(s) => Value::Str(s.clone()),
@@ -744,7 +824,7 @@ fn eval<'src>(
                 arg_vals.push(eval(arg, frame)?);
             }
 
-            if let Some(func) = frame.get_fn(*name) {
+            if let Some(func) = frame.get_fn(**name) {
                 func.call(&arg_vals, frame)
             } else {
                 panic!("Unknown function {name:?}");
@@ -783,19 +863,19 @@ fn eval<'src>(
 
 
 fn space_delimited<'src, O, E>(
-	f: impl Parser<&'src str, O, E>,
-	)-> impl FnMut(&'src str) -> IResult<&'src str, O, E>
+	f: impl Parser<Span<'src>, O, E>,
+	)-> impl FnMut(Span<'src>) -> IResult<Span<'src>, O, E>
 	 where 
-	 E: ParseError<&'src str>,
+	 E: ParseError<Span<'src>>,
 {
     delimited(multispace0, f, multispace0)
 }
 
-fn factor(i: &str) -> IResult<&str, Expression> {
+fn factor(i: Span) -> IResult<Span, Expression> {
     alt((str_literal, num_literal, func_call, ident, parens))(i)
 }
 
-fn func_call(i: &str) -> IResult<&str, Expression> {
+fn func_call(i: Span) -> IResult<Span, Expression> {
     let (r, ident) = space_delimited(identifier)(i)?;
     let (r, args) = space_delimited(delimited(
         tag("("),
@@ -806,15 +886,18 @@ fn func_call(i: &str) -> IResult<&str, Expression> {
         	)),
         tag(")"),
     ))(r)?;
-    Ok((r, Expression::FnInvoke(ident, args)))
+    Ok((r, Expression{
+        expr: ExprEnum::FnInvoke(ident, args),
+        span: i,
+    }))
 }
 
-fn ident(input: &str) -> IResult<&str, Expression> {
+fn ident(input: Span) -> IResult<Span, Expression> {
     let (r, res) = space_delimited(identifier)(input)?;
-    Ok((r, Expression::Ident(res)))
+    Ok((r, Expression{expr: ExprEnum::Ident(res), span: input},))
 }
 
-fn identifier (input: &str ) -> IResult<&str, &str> {
+fn identifier (input: Span ) -> IResult<Span, Span> {
     recognize(pair(
         alt((alpha1, tag("_"))),
         many0(alt((alphanumeric1, tag("_")))),
@@ -822,72 +905,79 @@ fn identifier (input: &str ) -> IResult<&str, &str> {
 }
 
 
-fn number(input: &str) -> IResult<&str, Expression> {
-    let (r, v) = space_delimited(recognize_float)(input)?;
+// fn number(input: &str) -> IResult<&str, Expression> {
+//     let (r, v) = space_delimited(recognize_float)(input)?;
+//
+//     Ok((
+//         r,
+//         Expression::NumLiteral(v.parse().map_err(|_| {
+//             nom::Err::Error(nom::error::Error {
+//                 input,
+//                 code: nom::error::ErrorKind::Digit,
+//             })
+//         })?),
+//     ))
+// }
 
-    Ok((
-        r,
-        Expression::NumLiteral(v.parse().map_err(|_| {
-            nom::Err::Error(nom::error::Error {
-                input,
-                code: nom::error::ErrorKind::Digit,
-            })
-        })?),
-    ))
-}
 
-
-fn parens(i: &str) -> IResult<&str, Expression> {
+fn parens(i: Span) -> IResult<Span, Expression> {
 	space_delimited(delimited(tag("("), expr, tag(")")))(i)
 
 }
 
 
-fn term(i: &str) -> IResult<&str, Expression> {
-    let (i, init) = factor(i)?;
+fn term(i: Span) -> IResult<Span, Expression> {
+    let (r, init) = factor(i)?;
 
-    fold_many0(
+    let res = fold_many0(
         pair(space_delimited(alt((char('*'), char('/')))), factor),
         move || init.clone(), 
         | acc, (op, val): (char, Expression) | {
+            let span = calc_offset(i, acc.span);
         match op {
-            '*' => Expression::Mul(Box::new(acc), Box::new(val)),
-            '/' => Expression::Div(Box::new(acc), Box::new(val)),
+            '*' => Expression::new(ExprEnum::Mul(Box::new(acc), Box::new(val)), span),
+            '/' => Expression::new(ExprEnum::Div(Box::new(acc), Box::new(val)), span),
             _ => panic!(
                 "Multiplicative expression should have * or / operator"
             ),
         }
     },
-    )(i)
+    )(r);
+    res
 }
-fn num_expr(i: &str) -> IResult<&str, Expression> {
-    let (i, init) = term(i)?;
+fn num_expr(i: Span) -> IResult<Span, Expression> {
+    let (r, init) = term(i)?;
 
-    fold_many0(
+    let res = fold_many0(
         pair(space_delimited(alt((char('+'), char('-')))), term),
         move || init.clone(),
-        | acc, (op, val): (char, Expression) | match op {
-                '+' => Expression::Add(Box::new(acc), Box::new(val)),
-                '-' => Expression::Sub(Box::new(acc), Box::new(val)),
+        | acc, (op, val): (char, Expression) | {
+            let span = calc_offset(i, acc.span);
+            match op {
+                '+' => Expression::new(ExprEnum::Add(Box::new(acc), Box::new(val)), span),
+                '-' => Expression::new(ExprEnum::Sub(Box::new(acc), Box::new(val)), span),
                 _ => {
-                	panic!(
-                    "Additive expression should have + or - operator"
-                )
+                    panic!(
+                        "Additive expression should have + or - operator"
+                    )
+                }
         }
     },
-    )(i)
+    )(r);
+    res
 }
 
-fn cond_expr(i: &str) -> IResult<&str, Expression> {
-    let (i, first) = num_expr(i)?;
+fn cond_expr(i0: Span) -> IResult<Span, Expression> {
+    let (i, first) = num_expr(i0)?;
     let (i, cond) = 
     space_delimited(alt((char('<'), char('>'))))(i)?;
     let (i, second) = num_expr(i)?;
+    let span = calc_offset(i0, i);
     Ok((
         i,
         match cond {
-            '<' => Expression::Lt(Box::new(first), Box::new(second)),
-            '>' => Expression::Gt(Box::new(first), Box::new(second)),
+            '<' => Expression::new(ExprEnum::Lt(Box::new(first), Box::new(second)), span),
+            '>' => Expression::new(ExprEnum::Gt(Box::new(first), Box::new(second)), span),
             _ => unreachable!(),
          },
     ))
@@ -895,18 +985,18 @@ fn cond_expr(i: &str) -> IResult<&str, Expression> {
 
 }
 
-fn open_brace(i: &str) -> IResult<&str, ()> {
+fn open_brace(i: Span) -> IResult<Span, ()> {
     let (i, _) = space_delimited(char('{'))(i)?;
     Ok((i, ()))
 }
 
-fn close_brace (i: &str) -> IResult<&str, ()> {
+fn close_brace (i: Span) -> IResult<Span, ()> {
     let (i, _) = space_delimited(char('}'))(i)?;
     Ok((i, ()))
 }
 
-fn if_expr(i: &str) -> IResult<&str, Expression> {
-    let (i, _) = space_delimited(tag("if"))(i)?;
+fn if_expr(i0: Span) -> IResult<Span, Expression> {
+    let (i, _) = space_delimited(tag("if"))(i0)?;
     let (i, cond) = expr(i)?;
     let (i, t_case) = 
       delimited(open_brace, statements, close_brace)(i)?;
@@ -917,51 +1007,66 @@ fn if_expr(i: &str) -> IResult<&str, Expression> {
 
     Ok((
         i,
-        Expression::If(
-        	Box::new(cond), 
-        	Box::new(t_case), 
-        	f_case.map(Box::new),
-        	),
+        Expression::new(
+            ExprEnum::If(
+            	Box::new(cond),
+            	Box::new(t_case),
+            	f_case.map(Box::new),
+        	    ),
+            calc_offset(i0, i)
+        ),
     ))
 }
 
 
-fn expr(i: &str) -> IResult<&str, Expression> {
+fn expr(i: Span) -> IResult<Span, Expression> {
     alt((if_expr, cond_expr, num_expr))(i)
 }
 
 
 
-fn var_def(i: &str) -> IResult<&str, Statement> {
+fn var_def(i: Span) -> IResult<Span, Statement> {
+    let span = i;
     let (i, _) = 
     delimited(multispace0, tag("var"), multispace1)(i)?;
-    let (i, name) = space_delimited(identifier)(i)?;
+    let (i, (name, td, ex)) = cut(|i| {
+        let (i, name) = space_delimited(identifier)(i)?;
+        let (i, _) = space_delimited(char(':'))(i)?;
+        let (i, td) = type_decl(i)?;
+        let (i, _) = space_delimited(char('='))(i)?;
+        let (i, ex) = space_delimited(expr)(i)?;
+        let (i, _) = space_delimited(char(';'))(i)?;
+        Ok((i, (name, td, ex)))
 
-    let (i, _) = space_delimited(char(':'))(i)?;
-    let (i, td) = type_decl(i)?;
+    })(i)?;
 
-    let (i, _) = space_delimited(char('='))(i)?;
-    let (i, expr) = space_delimited(expr)(i)?;
-    let (i, _) = space_delimited(char(';'))(i)?;
-    Ok((i, Statement::VarDef(name, td, expr)))
+    Ok((i, Statement::VarDef{
+        span: calc_offset(span, i),
+        name,
+        td,
+        ex
+    }))
 }
 
-fn type_decl(i: &str) -> IResult<&str, TypeDecl> {
+fn type_decl(i: Span) -> IResult<Span, TypeDecl> {
     let (i, td) = space_delimited(identifier)(i)?;
     Ok((
         i,
-        match td {
+        match *td.fragment() {
             "i64" => TypeDecl::I64,
             "f64" => TypeDecl::F64,
             "str" => TypeDecl::Str,
             _ => {
-                panic!("Type annotation has unknown type: {td}")
+                return Err(nom::Err::Failure(nom::error::Error::new(
+                    td,
+                    nom::error::ErrorKind::Verify,
+                )));
             }
         },
     ))
 }
 
-fn argument(i: &str) -> IResult<&str, (&str, TypeDecl)> {
+fn argument(i: Span) -> IResult<Span, (Span, TypeDecl)> {
     let (i, ident) = space_delimited(identifier)(i)?;
     let (i, _) = char(':')(i)?;
     let (i, td) = type_decl(i)?;
@@ -971,19 +1076,25 @@ fn argument(i: &str) -> IResult<&str, (&str, TypeDecl)> {
 
 
 
-fn var_assign(i: &str) -> IResult<&str, Statement> {
+fn var_assign(i: Span) -> IResult<Span, Statement> {
+    let span = i;
     let(i, name) = space_delimited(identifier)(i)?;
     let(i, _) = space_delimited(char('='))(i)?;
-    let(i, expr) = space_delimited(expr)(i)?;
-    Ok((i, Statement::VarAssign(name, expr)))
+    let(i, ex) = space_delimited(expr)(i)?;
+    Ok((i, Statement::VarAssign{
+        span: calc_offset(span, i),
+        name,
+        ex,
+    }))
 }
 
-fn expr_statement(i: &str) -> IResult<&str, Statement> {
+fn expr_statement(i: Span) -> IResult<Span, Statement> {
     let (i, res) = expr(i)?;
     Ok((i, Statement::Expression(res)))
 }
 
-fn for_statement(i: &str) -> IResult<&str, Statement> {
+fn for_statement(i: Span) -> IResult<Span, Statement> {
+    let i0 = i;
     let (i, _) = space_delimited(tag("for"))(i)?;
     let (i, loop_var) = space_delimited(identifier)(i)?;
     let (i, _) = space_delimited(tag("in"))(i)?;
@@ -996,6 +1107,7 @@ fn for_statement(i: &str) -> IResult<&str, Statement> {
     Ok((
         i,
         Statement::For {
+            span: calc_offset(i0, i),
             loop_var, 
             start, 
             end, 
@@ -1004,7 +1116,7 @@ fn for_statement(i: &str) -> IResult<&str, Statement> {
     ))
 
 }
-fn fn_def_statement(i: &str) -> IResult<&str, Statement> {
+fn fn_def_statement(i: Span) -> IResult<Span, Statement> {
     let (i, _) = space_delimited(tag("fn"))(i)?;
     let (i, name) = space_delimited(identifier)(i)?;
     let (i, _) = space_delimited(tag("("))(i)?;
@@ -1020,50 +1132,53 @@ fn fn_def_statement(i: &str) -> IResult<&str, Statement> {
 
 }
 
-fn return_statement(i: &str) -> IResult<&str, Statement> {
+fn return_statement(i: Span) -> IResult<Span, Statement> {
     let (i, _) = space_delimited(tag("return"))(i)?;
     let (i, ex) = space_delimited(expr)(i)?;
     Ok((i, Statement::Return(ex)))
 }
 
 
-fn break_statement(i: &str) -> IResult<&str, Statement> {
+fn break_statement(i: Span) -> IResult<Span, Statement> {
     let (i, _) = space_delimited(tag("break"))(i)?;
     Ok((i, Statement::Break))
 }
 
 
-fn continue_statement(i: &str) -> IResult<&str, Statement> {
+fn continue_statement(i: Span) -> IResult<Span, Statement> {
     let (i, _) = space_delimited(tag("continue"))(i)?;
     Ok((i, Statement::Continue))
 }
 
-fn str_literal(i: &str) -> IResult<&str, Expression> {
+fn str_literal(i: Span) -> IResult<Span, Expression> {
     let (r0, _) = preceded(multispace0, char('\"'))(i)?;
     let (r, val) = many0(none_of("\""))(r0)?;
     let (r, _) = terminated(char('"'), multispace0)(r)?;
 
-    Ok((r, Expression::StrLiteral(val.iter().collect::<String>().replace("\\\\", "\\").replace("\\n", "\n"))))
+    Ok((r, Expression::new(
+        ExprEnum::StrLiteral (
+                val.iter().collect::<String>().replace("\\\\", "\\").replace("\\n", "\n")), i), ))
 
 }
 
-fn num_literal(input: &str) -> IResult<&str, Expression> {
+fn num_literal(input: Span) -> IResult<Span, Expression> {
     let (r,v) = space_delimited(recognize_float)(input)?;
     Ok((
-        r, Expression::NumLiteral(v.parse().map_err(|_| {
+        r, Expression::new(ExprEnum::NumLiteral(v.parse().map_err(|_| {
             nom::Err::Error(nom::error::Error {
                 input, code: error::ErrorKind::Digit
             })
-        })?),
+        })?),v,
+        ),
     ))
 }
 
 
 fn general_statement<'a>(
 	last: bool,
-	 ) -> impl Fn(&'a str) -> IResult<&'a str, Statement> {
+	 ) -> impl Fn(Span<'a>) -> IResult<Span<'a>, Statement> {
 
-    let terminator = move |i| -> IResult<&str, ()> {
+    let terminator = move |i| -> IResult<Span, ()> {
         let mut semicolon = pair(tag(";"), multispace0);
         if last {
             Ok((opt(semicolon)(i)?.0, ()))
@@ -1086,32 +1201,33 @@ fn general_statement<'a>(
 }
 
 pub(crate) fn last_statement(
-	input: &str,
-	) -> IResult<&str, Statement> {
+	input: Span,
+	) -> IResult<Span, Statement> {
     general_statement(true)(input)
 }
 
 pub(crate) fn statement(
-	input :&str,
-	) -> IResult<&str, Statement> {
+	input :Span,
+	) -> IResult<Span, Statement> {
     general_statement(false)(input)
 }
 
-fn statements(i: &str) -> IResult<&str, Statements> {
+fn statements(i: Span) -> IResult<Span, Statements> {
   let (i, mut stmts) = many0(statement)(i)?;
   let (i, last) = opt(last_statement)(i)?;
   let (i, _) = opt(multispace0)(i)?;
   if let Some(last) = last {
     stmts.push(last);
   }
-  println!("statements {:?}", stmts);
+  //println!("statements {:?}", stmts);
   Ok((i, stmts))
 }
 
 
 fn statements_finish(
-	i: &str,
-	) -> Result<Statements, nom::error::Error<&str>> {
+	i: Span,
+	) -> Result<Statements, nom::error::Error<Span>> {
     let (_, res) = statements(i).finish()?;
     Ok(res)
 }
+
