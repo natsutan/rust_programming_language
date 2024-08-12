@@ -1,5 +1,5 @@
-var i: i64 = i64(123);
-var f: f64 = f64(123.456);
-var s: str = "Hello world!";
+fn add_ints(a: i64, b: i64) -> i64 {
+    return a + b;
+}
 
-
+var res: str = add_ints(123, 345);
